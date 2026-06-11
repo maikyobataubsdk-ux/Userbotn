@@ -17,6 +17,9 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 # --- CONSTANTS & CONFIG ---
+from dotenv import load_dotenv
+load_dotenv()
+
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -41,12 +44,14 @@ def to_small_caps(text: str) -> str:
 
 def remove_emojis(text: str) -> str:
     if not text: return ""
-    return re.sub(r'[^\x00-\x7F\u00A0-\u02AF\u0370-\u1CFF\u1E00-\u20CF\u2100-\u218F\u2C00-\u2DFF\u2E00-\u2E7F\uA720-\uA7FF\uAB30-\uAB6F]+', '', text)
+    # Remove emojis while preserving standard characters, small caps, and punctuation
+    # Small caps are in Phonetic Extensions (1D00–1D7F) and Latin Extended-D (A720–A7FF)
+    return re.sub(r'[^\x00-\x7F\u00A0-\u02AF\u0370-\u1CFF\u1D00-\u20CF\u2100-\u218F\u2C00-\u2DFF\u2E00-\u2E7F\uA720-\uA7FF\uAB30-\uAB6F]+', '', text)
 
 def best_format(text: str) -> str:
     if not text: return ""
     # Regex to find URLs so we don't mess them up with small caps
-    url_pattern = r'(https?://\S+)'
+    url_pattern = r'(https?://\S+|t\.me/\S+)'
     parts = re.split(url_pattern, text)
     formatted_parts = []
     for part in parts:
@@ -414,7 +419,7 @@ class Engine:
 
 
 # --- BOT SETUP ---
-bot = Client("automator_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+bot = Client("automator_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 db = DB()
 am = AccountManager(db)
 engine = Engine(db, am)
@@ -468,8 +473,8 @@ async def cmd_list_accounts(client, message):
 
     res = "<b>ᴀᴄᴄᴏᴜɴᴛ ʟɪꜱᴛ:</b>\n\n"
     for a in accs:
-        status = "✅" if a["active"] else "❌"
-        if a["banned"]: status = "🚫"
+        status = "[ᴀᴄᴛɪᴠᴇ]" if a["active"] else "[ɪɴᴀᴄᴛɪᴠᴇ]"
+        if a["banned"]: status = "[ʙᴀɴɴᴇᴅ]"
         res += best_format(f"{status} @{a['username']} | ꜱ: {a['stats']['sent']} | ꜰ: {a['stats']['floods']}\n")
 
     await message.reply_text(res, parse_mode=enums.ParseMode.HTML)
@@ -695,7 +700,7 @@ async def cmd_start(client, message):
 # --- MAIN ---
 async def main():
     if not await db.ping():
-        logger.error("Could not connect to MongoDB. Exiting.")
+        logger.error("Database initialization failed. Exiting.")
         return
 
     logger.info("Starting bot...")
