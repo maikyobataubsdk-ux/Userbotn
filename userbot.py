@@ -7,11 +7,11 @@ import functools
 from datetime import datetime, UTC
 from typing import Union, List, Optional
 
+import json
+import uuid
 from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait, RPCError, UserBlocked, UserDeactivated, SessionPasswordNeeded
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaVideo, InputMediaDocument
-from motor.motor_asyncio import AsyncIOMotorClient
-from bson import ObjectId
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -20,7 +20,6 @@ from apscheduler.triggers.interval import IntervalTrigger
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGO_URL = os.getenv("MONGO_URL")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -75,83 +74,170 @@ def cb_admin(func):
 
 # --- DATABASE ---
 class DB:
-    def __init__(self, url):
-        self.client = AsyncIOMotorClient(url, serverSelectionTimeoutMS=5000)
-        self.db = self.client.automator
-        self.cfg = self.db.cfg
-        self.acc = self.db.accounts
-        self.tmpl = self.db.templates
-        self.stats = self.db.stats
-        self.bl = self.db.blacklist
-        self.logs = self.db.logs
-        self.amsg = self.db.account_messages
+    def __init__(self, filename="database.json"):
+        self.filename = filename
+        self.lock = asyncio.Lock()
+        self._data = {
+            "cfg": {},
+            "accounts": [],
+            "templates": [],
+            "stats": {},
+            "blacklist": {},
+            "logs": [],
+            "account_messages": []
+        }
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self.filename):
+            try:
+                with open(self.filename, "r") as f:
+                    self._data.update(json.load(f))
+            except Exception as e:
+                logger.error(f"Failed to load database: {e}")
+
+    def _save(self):
+        def default_serializer(obj):
+            if isinstance(obj, datetime):
+                return obj.isoformat()
+            return str(obj)
+
+        try:
+            with open(self.filename, "w") as f:
+                json.dump(self._data, f, indent=4, default=default_serializer)
+        except Exception as e:
+            logger.error(f"Failed to save database: {e}")
 
     async def ping(self):
-        try:
-            await self.client.admin.command('ping')
-            return True
-        except Exception as e:
-            logger.error(f"DB Ping failed: {e}")
-            return False
+        # Always return True as we're using a local file
+        return True
 
     async def get_cfg(self, key, default=None):
-        doc = await self.cfg.find_one({"_id": key})
-        return doc["value"] if doc else default
+        async with self.lock:
+            return self._data["cfg"].get(key, default)
 
     async def set_cfg(self, key, value):
-        await self.cfg.update_one({"_id": key}, {"$set": {"value": value}}, upsert=True)
+        async with self.lock:
+            self._data["cfg"][key] = value
+            self._save()
 
     async def get_accounts(self, active_only=True):
-        query = {"banned": False}
-        if active_only:
-            query["active"] = True
-        return await self.acc.find(query).to_list(length=None)
+        async with self.lock:
+            accs = self._data["accounts"]
+            if active_only:
+                return [a for a in accs if a.get("active") and not a.get("banned")]
+            return [a for a in accs]
 
     async def add_account(self, data):
-        data["username"] = data["username"].lower().replace("@", "")
-        data["added"] = datetime.now(UTC)
-        return await self.acc.insert_one(data)
+        async with self.lock:
+            data["username"] = data["username"].lower().replace("@", "")
+            data["added"] = datetime.now(UTC).isoformat()
+            # Remove existing if any
+            self._data["accounts"] = [a for a in self._data["accounts"] if a["username"] != data["username"]]
+            self._data["accounts"].append(data)
+            self._save()
 
     async def update_acc_stats(self, username, sent=0, failed=0, floods=0):
-        await self.acc.update_one(
-            {"username": username.lower()},
-            {"$inc": {"stats.sent": sent, "stats.failed": failed, "stats.floods": floods},
-             "$set": {"stats.last_active": datetime.now(UTC)}}
-        )
+        async with self.lock:
+            username = username.lower()
+            for a in self._data["accounts"]:
+                if a["username"] == username:
+                    stats = a.setdefault("stats", {"sent": 0, "failed": 0, "floods": 0})
+                    stats["sent"] = stats.get("sent", 0) + sent
+                    stats["failed"] = stats.get("failed", 0) + failed
+                    stats["floods"] = stats.get("floods", 0) + floods
+                    stats["last_active"] = datetime.now(UTC).isoformat()
+                    break
+            self._save()
 
-    async def get_templates(self):
-        return await self.tmpl.find({"active": True}).to_list(length=None)
+    async def update_account_status(self, username, banned=None, active=None):
+        async with self.lock:
+            username = username.lower()
+            for a in self._data["accounts"]:
+                if a["username"] == username:
+                    if banned is not None: a["banned"] = banned
+                    if active is not None: a["active"] = active
+                    break
+            self._save()
+
+    async def get_templates(self, active_only=True):
+        async with self.lock:
+            tmpls = self._data["templates"]
+            if active_only:
+                return [t for t in tmpls if t.get("active")]
+            return tmpls
+
+    async def add_template(self, data):
+        async with self.lock:
+            data["_id"] = str(uuid.uuid4())
+            if "created" not in data:
+                data["created"] = datetime.now(UTC).isoformat()
+            self._data["templates"].append(data)
+            self._save()
+
+    async def delete_template(self, template_id):
+        async with self.lock:
+            self._data["templates"] = [t for t in self._data["templates"] if t.get("_id") != template_id]
+            self._save()
 
     async def get_amsg(self, username):
-        return await self.amsg.find_one({"username": username.lower()})
+        async with self.lock:
+            username = username.lower()
+            for m in self._data["account_messages"]:
+                if m["username"] == username:
+                    return m
+            return None
 
     async def set_amsg(self, username, data):
-        data["username"] = username.lower().replace("@", "")
-        data["updated"] = datetime.now(UTC)
-        await self.amsg.update_one({"username": data["username"]}, {"$set": data}, upsert=True)
+        async with self.lock:
+            username = username.lower().replace("@", "")
+            data["username"] = username
+            data["updated"] = datetime.now(UTC).isoformat()
+            # Remove existing
+            self._data["account_messages"] = [m for m in self._data["account_messages"] if m["username"] != username]
+            self._data["account_messages"].append(data)
+            self._save()
 
     async def del_amsg(self, username):
-        await self.amsg.delete_one({"username": username.lower().replace("@", "")})
+        async with self.lock:
+            username = username.lower().replace("@", "")
+            self._data["account_messages"] = [m for m in self._data["account_messages"] if m["username"] != username]
+            self._save()
+
+    async def get_all_amsgs(self):
+        async with self.lock:
+            return self._data["account_messages"]
 
     async def get_targets(self):
         return await self.get_cfg("targets", [])
 
     async def is_blacklisted(self, target):
-        doc = await self.bl.find_one({"_id": str(target)})
-        return doc is not None
+        async with self.lock:
+            return str(target) in self._data["blacklist"]
 
     async def add_to_blacklist(self, target):
-        await self.bl.update_one({"_id": str(target)}, {"$set": {"added": datetime.now(UTC)}}, upsert=True)
+        async with self.lock:
+            self._data["blacklist"][str(target)] = {"added": datetime.now(UTC).isoformat()}
+            self._save()
 
     async def remove_from_blacklist(self, target):
-        await self.bl.delete_one({"_id": str(target)})
+        async with self.lock:
+            target_str = str(target)
+            if target_str in self._data["blacklist"]:
+                del self._data["blacklist"][target_str]
+                self._save()
 
     async def log_event(self, event, details):
-        await self.logs.insert_one({
-            "event": event,
-            "details": details,
-            "timestamp": datetime.now(UTC)
-        })
+        async with self.lock:
+            self._data["logs"].append({
+                "event": event,
+                "details": details,
+                "timestamp": datetime.now(UTC).isoformat()
+            })
+            # Keep only last 1000 logs
+            if len(self._data["logs"]) > 1000:
+                self._data["logs"] = self._data["logs"][-1000:]
+            self._save()
 
 
 # --- ACCOUNT MANAGER ---
@@ -188,7 +274,7 @@ class AccountManager:
                     await client.start()
                 active_clients.append(client)
             except (UserDeactivated, UserBlocked):
-                await self.db.acc.update_one({"username": acc["username"]}, {"$set": {"banned": True, "active": False}})
+                await self.db.update_account_status(acc["username"], banned=True, active=False)
                 logger.warning(f"Account {acc['username']} is banned/deactivated.")
             except Exception as e:
                 logger.error(f"Failed to start client {acc['username']}: {e}")
@@ -329,7 +415,7 @@ class Engine:
 
 # --- BOT SETUP ---
 bot = Client("automator_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-db = DB(MONGO_URL)
+db = DB()
 am = AccountManager(db)
 engine = Engine(db, am)
 scheduler = AsyncIOScheduler()
@@ -399,7 +485,7 @@ async def cmd_set_massage(client, message):
     sub = args[1].lower()
 
     if sub == "list":
-        amsgs = await db.amsg.find().to_list(None)
+        amsgs = await db.get_all_amsgs()
         if not amsgs: return await message.reply_text(best_format("No custom messages"))
         res = "<b>ᴄᴜꜱᴛᴏᴍ ᴍᴇꜱꜱᴀɢᴇꜱ:</b>\n"
         for m in amsgs:
@@ -446,7 +532,7 @@ async def cmd_set_massage(client, message):
 @bot.on_message(filters.command("add_template") & filters.private)
 @admin_only
 async def cmd_add_template(client, message):
-    data = {"active": True, "created": datetime.now(UTC), "used": 0}
+    data = {"active": True, "used": 0}
     if message.reply_to_message:
         r = message.reply_to_message
         if r.photo: data.update({"type": "photo", "file_id": r.photo.file_id, "caption": r.caption})
@@ -463,17 +549,17 @@ async def cmd_add_template(client, message):
         else:
             data.update({"type": "text", "content": content})
 
-    await db.tmpl.insert_one(data)
+    await db.add_template(data)
     await message.reply_text(best_format("Template added"))
 
 @bot.on_message(filters.command("list_templates") & filters.private)
 @admin_only
 async def cmd_list_templates(client, message):
-    tmpls = await db.tmpl.find().to_list(None)
+    tmpls = await db.get_templates(active_only=False)
     if not tmpls: return await message.reply_text(best_format("No templates"))
     res = "<b>ᴛᴇᴍᴘʟᴀᴛᴇꜱ:</b>\n"
     for i, t in enumerate(tmpls):
-        res += best_format(f"{i+1}. {t['type']} | ᴜꜱᴇᴅ: {t['used']}\n")
+        res += best_format(f"{i+1}. {t['type']} | ᴜꜱᴇᴅ: {t.get('used', 0)}\n")
     await message.reply_text(res, parse_mode=enums.ParseMode.HTML)
 
 @bot.on_message(filters.command("del_template") & filters.private)
@@ -481,10 +567,14 @@ async def cmd_list_templates(client, message):
 async def cmd_del_template(client, message):
     parts = message.text.split()
     if len(parts) < 2: return await message.reply_text(best_format("Usage: /del_template <num>"))
-    idx = int(parts[1]) - 1
-    tmpls = await db.tmpl.find().to_list(None)
+    try:
+        idx = int(parts[1]) - 1
+    except ValueError:
+        return await message.reply_text(best_format("Invalid template number"))
+
+    tmpls = await db.get_templates(active_only=False)
     if 0 <= idx < len(tmpls):
-        await db.tmpl.delete_one({"_id": tmpls[idx]["_id"]})
+        await db.delete_template(tmpls[idx]["_id"])
         await message.reply_text(best_format("Template deleted"))
 
 # --- COMMANDS: TARGETS ---
